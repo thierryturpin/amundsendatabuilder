@@ -10,7 +10,7 @@ import six
 from neo4j.v1 import GraphDatabase, Transaction  # noqa: F401
 from pyhocon import ConfigFactory  # noqa: F401
 from pyhocon import ConfigTree  # noqa: F401
-from typing import Set, List  # noqa: F401
+from typing import Set, List, Tuple  # noqa: F401
 
 from databuilder.publisher.base_publisher import Publisher
 
@@ -73,7 +73,7 @@ DEFAULT_CONFIG = ConfigFactory.from_dict({NEO4J_TRANSCATION_SIZE: 500,
                                           NEO4J_RELATIONSHIP_CREATION_CONFIRM: False,
                                           NEO4J_MAX_CONN_LIFE_TIME_SEC: 50})
 
-NODE_MERGE_TEMPLATE = Template("""MERGE (node:$LABEL {key: '${KEY}'})
+NODE_MERGE_TEMPLATE = Template("""MERGE (node:$LABEL { key: $$KEY })
 ON CREATE SET ${create_prop_body}
 ${update_statement}""")
 
@@ -163,13 +163,13 @@ class Neo4jCsvPublisher(Publisher):
             except StopIteration:
                 break
 
-        LOGGER.info('Publishing Relationship files: {}'.format(self._relation_files))
-        while True:
-            try:
-                relation_file = next(self._relation_files_iter)
-                self._publish_relation(relation_file)
-            except StopIteration:
-                break
+        # LOGGER.info('Publishing Relationship files: {}'.format(self._relation_files))
+        # while True:
+        #     try:
+        #         relation_file = next(self._relation_files_iter)
+        #         self._publish_relation(relation_file)
+        #     except StopIteration:
+        #         break
 
         # TODO: Add statsd support
         LOGGER.info('Successfully published. Elapsed: {} seconds'.format(time.time() - start))
@@ -199,20 +199,27 @@ class Neo4jCsvPublisher(Publisher):
         tx = self._session.begin_transaction()
         with open(node_file, 'r') as node_csv:
             for count, node_record in enumerate(csv.DictReader(node_csv)):
-                label = node_record[NODE_LABEL_KEY]
-                # If label is seen for the first time, try creating unique index
-                if label not in self.labels:
-                    tx.commit()  # Transaction needs to be committed as index update will make transaction to abort.
-                    LOGGER.info('Committed {} records'.format(count + 1))
+                # label = node_record[NODE_LABEL_KEY]
+                # # If label is seen for the first time, try creating unique index
+                # if label not in self.labels:
+                #     tx.commit()  # Transaction needs to be committed as index update will make transaction to abort.
+                #     LOGGER.info('Committed {} records'.format(count + 1))
+                #
+                #     self._try_create_index(label)
+                #     self.labels.add(label)
+                #     tx = self._session.begin_transaction()
 
-                    self._try_create_index(label)
-                    self.labels.add(label)
-                    tx = self._session.begin_transaction()
+                stmt, params = self.create_node_merge_statement(node_record=node_record)
+                # LOGGER.info('stmt: {}'.format(stmt))
+                # LOGGER.info('params: {}'.format(params))
+                tx = self._execute_statement(stmt, tx, count, params=params)
 
-                stmt = self.create_node_merge_statement(node_record=node_record)
-                tx = self._execute_statement(stmt, tx, count)
-
-        tx.commit()
+        try:
+            tx.commit()
+        except:
+            LOGGER.exception('Failed 1')
+            raise
+        # tx.commit()
         LOGGER.info('Committed {} records'.format(count + 1))
 
     def is_create_only_node(self, node_record):
@@ -228,7 +235,7 @@ class Neo4jCsvPublisher(Publisher):
             return False
 
     def create_node_merge_statement(self, node_record):
-        # type: (dict) -> str
+        # type: (dict) -> Tuple[str, Dict[str, Any]]
         """
         Creates node merge statement
         :param node_record:
@@ -243,7 +250,12 @@ class Neo4jCsvPublisher(Publisher):
             update_statement = NODE_UPDATE_TEMPLATE.substitute(update_prop_body=update_prop_body)
         params['update_statement'] = update_statement
 
-        return NODE_MERGE_TEMPLATE.substitute(params)
+        stmt = NODE_MERGE_TEMPLATE.substitute(params)
+
+        params = copy.deepcopy(node_record)
+        params[PUBLISHED_TAG_PROPERTY_NAME] = self.publish_tag
+        params.pop('LABEL')
+        return stmt, params
 
     def _publish_relation(self, relation_file):
         # type: (str) -> None
@@ -327,13 +339,13 @@ ON MATCH SET {update_prop_body}""".format(create_prop_body=create_prop_body,
                 k = k[:-len(UNQUOTED_SUFFIX)]
                 props.append('{id}.{key} = {val}'.format(id=identifier, key=k, val=v))
             else:
-                props.append("""{id}.{key} = '{val}'""".format(id=identifier, key=k, val=v))
+                props.append("""{id}.{key} = ${key}""".format(id=identifier, key=k))
 
             template_params[k] = v
 
-        props.append("""{id}.{key} = '{val}'""".format(id=identifier,
-                                                       key=PUBLISHED_TAG_PROPERTY_NAME,
-                                                       val=self.publish_tag))
+        props.append("""{id}.{key} = ${key}""".format(id=identifier,
+                                                      key=PUBLISHED_TAG_PROPERTY_NAME,
+                                                      val=self.publish_tag))
 
         return ', '.join(props)
 
@@ -341,6 +353,7 @@ ON MATCH SET {update_prop_body}""".format(create_prop_body=create_prop_body,
                            stmt,
                            tx,
                            count,
+                           params={},
                            expect_result=False):
         # type: (str, Transaction, int, bool) -> Transaction
 
@@ -357,10 +370,12 @@ ON MATCH SET {update_prop_body}""".format(create_prop_body=create_prop_body,
             if LOGGER.isEnabledFor(logging.DEBUG):
                 LOGGER.debug('Executing statement: {}'.format(stmt))
 
+            # LOGGER.info('Executing statement: {}'.format(stmt))
+            # LOGGER.info('params: {}'.format(params))
             if six.PY2:
-                result = tx.run(unicode(stmt, errors='ignore')) # noqa
+                result = tx.run(unicode(stmt, errors='ignore'), **params) # noqa
             else:
-                result = tx.run(str(stmt).encode('utf-8', 'ignore'))
+                result = tx.run(str(stmt).encode('utf-8', 'ignore'), **params)
             if expect_result and not result.single():
                 raise RuntimeError('Failed to executed statement: {}'.format(stmt))
 
